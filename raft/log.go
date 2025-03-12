@@ -14,13 +14,17 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"math"
+
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
-//  snapshot/first.....applied....committed....stabled.....last
-//  --------|------------------------------------------------|
-//                            log entries
+//	snapshot/first.....applied....committed....stabled.....last
+//	--------|------------------------------------------------|
+//	                          log entries
 //
 // for simplify the RaftLog implement should manage all log entries
 // that not truncated
@@ -50,13 +54,27 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	appendIdx uint64 // 接收leader日志后的索引，主要是与leader传来的commit做比较，更新follower的commit index
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	firstIndex, _ := storage.FirstIndex()
+	lastIndex, _ := storage.LastIndex()
+	hardState, _, _ := storage.InitialState()
+	entries, _ := storage.Entries(firstIndex, lastIndex+1)
+	raftlog := &RaftLog{
+		storage:         storage,
+		committed:       hardState.Commit,
+		applied:         firstIndex - 1,
+		stabled:         lastIndex,
+		entries:         entries,
+		pendingSnapshot: nil,
+		appendIdx:       math.MaxUint64,
+	}
+	return raftlog
 }
 
 // We need to compact the log entries in some point of time like
@@ -71,29 +89,77 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 {
+		return l.entries
+	}
 	return nil
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 {
+		if (l.stabled-l.FirstIndex()+1 < 0) ||
+			(l.stabled-l.FirstIndex()+1 >= uint64(len(l.entries))) {
+			return nil
+		}
+		return l.entries[l.stabled-l.FirstIndex()+1:]
+	}
 	return nil
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 {
+		if int64(l.committed-l.FirstIndex()+1) < 0 ||
+			l.committed-l.FirstIndex()+1 >= uint64(len(l.entries)) {
+			return nil
+		}
+		if int64(l.applied-l.committed+1) >= 0 && l.committed-l.FirstIndex()+1 <= uint64(len(l.entries)) {
+			return l.entries[l.applied-l.committed+1 : l.committed-l.FirstIndex()+1]
+		}
+	}
 	return nil
+}
+
+func (l *RaftLog) FirstIndex() uint64 {
+	if len(l.entries) == 0 {
+		i, _ := l.storage.FirstIndex() // 第一个元素是空的
+		return i - 1
+	}
+	return l.entries[0].Index
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	if len(l.entries) == 0 {
+		// 没有entry，说明都已经是持久化过的了
+		return l.stabled
+	}
+	return l.entries[len(l.entries)-1].Index
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if len(l.entries) > 0 {
+		offset := l.FirstIndex()
+		if i >= offset {
+			index := i - l.FirstIndex()
+			if index >= uint64(len(l.entries)) {
+				return 0, ErrUnavailable
+			}
+			return l.entries[index].Term, nil
+		}
+	}
+	// 所有的日志都被压缩了需要在storage中找
+	term, err := l.storage.Term(i)
+	if err != nil && !IsEmptySnap(l.pendingSnapshot) {
+		if i < l.pendingSnapshot.Metadata.Index {
+			err = ErrCompacted
+		}
+	}
+	return term, err
 }
