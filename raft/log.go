@@ -97,36 +97,38 @@ func (l *RaftLog) allEntries() []pb.Entry {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	// Your Code Here (2A).
 	if len(l.entries) > 0 {
-		if (l.stabled-l.FirstIndex()+1 < 0) ||
-			(l.stabled-l.FirstIndex()+1 >= uint64(len(l.entries))) {
-			return nil
+		firstIndex := l.FirstIndex()
+		if l.stabled < firstIndex {
+			return l.entries
 		}
-		return l.entries[l.stabled-l.FirstIndex()+1:]
+		if l.stabled-firstIndex >= uint64(len(l.entries)-1) {
+			return make([]pb.Entry, 0)
+		}
+		return l.entries[l.stabled-firstIndex+1:]
 	}
-	return nil
+	return make([]pb.Entry, 0)
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
+	firstIndex := l.FirstIndex()
+	appliedIndex := l.applied
+	commitedIndex := l.committed
 	if len(l.entries) > 0 {
-		if int64(l.committed-l.FirstIndex()+1) < 0 ||
-			l.committed-l.FirstIndex()+1 >= uint64(len(l.entries)) {
-			return nil
-		}
-		if int64(l.applied-l.committed+1) >= 0 && l.committed-l.FirstIndex()+1 <= uint64(len(l.entries)) {
-			return l.entries[l.applied-l.committed+1 : l.committed-l.FirstIndex()+1]
+		if appliedIndex >= firstIndex-1 && commitedIndex >= firstIndex-1 && appliedIndex < commitedIndex && commitedIndex <= l.LastIndex() {
+			// 这里需要注意索引的范围
+			return l.entries[appliedIndex-firstIndex+1 : commitedIndex-firstIndex+1]
 		}
 	}
-	return nil
+	return make([]pb.Entry, 0)
 }
 
 func (l *RaftLog) FirstIndex() uint64 {
 	if len(l.entries) == 0 {
 		i, _ := l.storage.FirstIndex() // 第一个元素是空的
-		return i - 1
+		return i
 	}
 	return l.entries[0].Index
 }
@@ -135,8 +137,8 @@ func (l *RaftLog) FirstIndex() uint64 {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
-		// 没有entry，说明都已经是持久化过的了
-		return l.stabled
+		index, _ := l.storage.LastIndex()
+		return index
 	}
 	return l.entries[len(l.entries)-1].Index
 }
@@ -156,10 +158,23 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	}
 	// 所有的日志都被压缩了需要在storage中找
 	term, err := l.storage.Term(i)
-	if err != nil && !IsEmptySnap(l.pendingSnapshot) {
-		if i < l.pendingSnapshot.Metadata.Index {
-			err = ErrCompacted
-		}
+	if err == nil {
+		return term, nil
 	}
-	return term, err
+	return 0, err
+}
+
+func (l *RaftLog) appliedTo(toApply uint64) {
+	l.applied = toApply
+}
+
+// 参考 etcd commitTo
+func (l *RaftLog) commitTo(toCommit uint64) {
+	// never decrease commit
+	if l.committed < toCommit {
+		//if l.LastIndex() < toCommit {
+		//	log.Panicf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", toCommit, l.LastIndex())
+		//}
+		l.committed = toCommit
+	}
 }
