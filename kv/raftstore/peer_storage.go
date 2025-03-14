@@ -308,7 +308,31 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
-	return nil
+	if len(entries) == 0 {
+		return nil
+	}
+	var err error = nil
+	enFirstIndex := entries[0].Index
+	enLastIndex := entries[len(entries)-1].Index
+	psFirstIndex, _ := ps.FirstIndex()
+	psLastIndex, _ := ps.LastIndex()
+
+	if enLastIndex < psLastIndex {
+		return nil
+
+	}
+	if enFirstIndex < psFirstIndex {
+		entries = entries[psLastIndex-enFirstIndex:]
+	}
+	// set meta
+	for _, entry := range entries {
+		err = raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	}
+	// delete conflict
+	for i := enLastIndex + 1; i <= psLastIndex; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	}
+	return err
 }
 
 // Apply the peer with given snapshot
@@ -331,7 +355,36 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+	// var applySnap *ApplySnapResult = nil
+	// kvWB := new(engine_util.WriteBatch)
+	raftWB := new(engine_util.WriteBatch)
+
+	// 持久化entry
+	err := ps.Append(ready.Entries, raftWB)
+	// update raftlocalstate
+	// 1. lastindex
+	// 2. lastterm
+	// 3. HardState
+	if len(ready.Entries) != 0 {
+		newLastIndex := ready.Entries[len(ready.Entries)-1].Index
+		newLastTerm := ready.Entries[len(ready.Entries)-1].Term
+		if newLastIndex > ps.raftState.LastIndex {
+			ps.raftState.LastIndex = newLastIndex
+			ps.raftState.LastTerm = newLastTerm
+		}
+	}
+
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	// update raftlocalstate
+	err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+
+	// write in disk
+	err = raftWB.WriteToDB(ps.Engines.Raft)
+	// err = kvWB.WriteToDB(ps.Engines.Kv)
+	return nil, err
 }
 
 func (ps *PeerStorage) ClearData() {
