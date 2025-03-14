@@ -38,9 +38,9 @@ func (r *regionItem) Less(other btree.Item) bool {
 type storeMeta struct {
 	sync.RWMutex
 	/// region start key -> region
-	regionRanges *btree.BTree
+	regionRanges *btree.BTree // 用于快速定位某一个 key 在哪个 region 中
 	/// region_id -> region
-	regions map[uint64]*metapb.Region
+	regions map[uint64]*metapb.Region // region id 映射 region 结构体
 	/// `MsgRequestVote` messages from newly split Regions shouldn't be dropped if there is no
 	/// such Region in this store now. So the messages are recorded temporarily and will be handled later.
 	pendingVotes []*rspb.RaftMessage
@@ -104,8 +104,8 @@ type Transport interface {
 	Send(msg *rspb.RaftMessage) error
 }
 
-/// loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
-/// WARN: This store should not be used before initialized.
+// / loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
+// / WARN: This store should not be used before initialized.
 func (bs *Raftstore) loadPeers() ([]*peer, error) {
 	// Scan region meta to get saved regions.
 	startKey := meta.RegionMetaMinKey
@@ -210,6 +210,7 @@ type Raftstore struct {
 	wg         *sync.WaitGroup
 }
 
+// 存储节点的启动
 func (bs *Raftstore) start(
 	meta *metapb.Store,
 	cfg *config.Config,

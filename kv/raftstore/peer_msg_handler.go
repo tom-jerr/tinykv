@@ -218,53 +218,67 @@ func (d *peerMsgHandler) execSnap(entry *eraftpb.Entry, req *raft_cmdpb.RaftCmdR
 }
 
 func (d *peerMsgHandler) processProposals(resp *raft_cmdpb.RaftCmdResponse, entry *eraftpb.Entry, isExecSnap bool) {
-	length := len(d.proposals)
-	if length > 0 {
-		// 丢弃比entry索引更小的请求
-		d.dropStaleProposal(entry)
-		if len(d.proposals) == 0 {
+	// length := len(d.proposals)
+	// if length > 0 {
+	// 	// 丢弃比entry索引更小的请求
+	// 	d.dropStaleProposal(entry)
+	// 	if len(d.proposals) == 0 {
+	// 		return
+	// 	}
+	// 	p := d.proposals[0]
+	// 	if p.index > entry.Index {
+	// 		return
+	// 	}
+	// 	// It may due to leader changes that some logs are not committed and overrided with new leaders’ logs.
+	// 	if p.term != entry.Term {
+	// 		NotifyStaleReq(entry.Term, p.cb)
+	// 		d.proposals = d.proposals[1:]
+	// 		return
+	// 	}
+	// 	// p.index == entry.Index && p.term == entry.Term， 开始执行并回应
+	// 	if isExecSnap {
+	// 		p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // 注意时序，一定要在 Done 之前完成
+	// 	}
+	// 	p.cb.Done(resp)
+	// 	d.proposals = d.proposals[1:]
+	// 	return
+	// }
+	for len(d.proposals) > 0 {
+		proposal := d.proposals[0]
+		if entry.Term < proposal.term {
 			return
 		}
-		p := d.proposals[0]
-		if p.index > entry.Index {
+
+		if entry.Term > proposal.term {
+			proposal.cb.Done(ErrRespStaleCommand(proposal.term))
+			d.proposals = d.proposals[1:]
+			continue
+		}
+
+		if entry.Term == proposal.term && entry.Index < proposal.index {
 			return
 		}
-		// It may due to leader changes that some logs are not committed and overrided with new leaders’ logs.
-		if p.term != entry.Term {
-			NotifyStaleReq(entry.Term, p.cb)
+
+		if entry.Term == proposal.term && entry.Index > proposal.index {
+			proposal.cb.Done(ErrRespStaleCommand(proposal.term))
+			d.proposals = d.proposals[1:]
+			continue
+		}
+
+		if entry.Index == proposal.index && entry.Term == proposal.term {
+			if resp.Header == nil {
+				resp.Header = &raft_cmdpb.RaftResponseHeader{}
+			}
+			if isExecSnap {
+				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // 注意时序，一定要在 Done 之前完成
+			}
+			// proposal.cb.Txn = txn
+			proposal.cb.Done(resp)
 			d.proposals = d.proposals[1:]
 			return
 		}
-		// p.index == entry.Index && p.term == entry.Term， 开始执行并回应
-		if isExecSnap {
-			p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // 注意时序，一定要在 Done 之前完成
-		}
-		p.cb.Done(resp)
-		d.proposals = d.proposals[1:]
-		return
-	}
-}
 
-// 丢弃过时的 proposal
-func (d *peerMsgHandler) dropStaleProposal(entry *eraftpb.Entry) {
-	length := len(d.proposals)
-	if length > 0 {
-		first := 0
-		// 前面未回应的都说明过时了, 直接回应过时错误
-		for first < length {
-			p := d.proposals[first]
-			if p.index < entry.Index {
-				p.cb.Done(ErrResp(&util.ErrStaleCommand{}))
-				first++
-			} else {
-				break
-			}
-		}
-		if first == length {
-			d.proposals = make([]*proposal, 0)
-			return
-		}
-		d.proposals = d.proposals[first:]
+		panic("This should not happen.")
 	}
 }
 
