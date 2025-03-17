@@ -16,7 +16,6 @@ package raft
 
 import (
 	"errors"
-	"fmt"
 	"math/rand"
 	"sort"
 
@@ -24,7 +23,7 @@ import (
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
-const debug bool = false
+const debug bool = true
 
 // None is a placeholder node ID used when there is no leader.
 const None uint64 = 0
@@ -213,7 +212,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	}
 	if debug {
-		fmt.Printf("%x send append to %x at term %d\n", r.id, to, r.Term)
+		PrettyDebug(dLeader, "%x send append to %x at term %d\n", r.id, to, r.Term)
 	}
 	prevLogIndex := r.Prs[to].Next - 1               // 紧邻新日志条目之前的那个日志条目的索引
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex) // 紧邻新日志条目之前的那个日志条目的任期
@@ -221,7 +220,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	firstIndex := r.RaftLog.FirstIndex()
 	if err != nil || prevLogIndex < firstIndex-1 {
 		// 如果prevLogIndex小于firstIndex-1，说明prevLogIndex之前的日志条目已经被压缩了
-		// TODO(LZY): send snapshot
+		r.sendSnapshot(to)
 		return true
 	}
 	var entries []*pb.Entry
@@ -240,10 +239,37 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Entries: entries,
 	}
 	r.msgs = append(r.msgs, msg)
-	if debug {
-		fmt.Printf("%x send raft message %s from %x to %x\n", r.id, pb.MessageType_MsgAppend, r.id, to)
-	}
 	return true
+}
+
+// send snapshot not rather entries
+func (r *Raft) sendSnapshot(to uint64) {
+	// snapshot中存有snapshotmetadata，里面有index和term以及ConfState
+	// ConfState contains the current membership information of the raft group
+	if _, ok := r.Prs[to]; !ok {
+		return
+	}
+	var snapshot pb.Snapshot
+	var err error
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		snapshot = *r.RaftLog.pendingSnapshot
+	} else {
+		snapshot, err = r.RaftLog.storage.Snapshot()
+
+	}
+	if err != nil {
+		// 因为 Snapshot 很大，不会马上生成，这里为了避免阻塞，生成操作设为异步，如果 Snapshot 还没有生成好，Snapshot 会先返回 raft.ErrSnapshotTemporarilyUnavailable 错误，Leader 就应该放弃本次 Snapshot，等待下一次再次请求 Snapshot。
+		return
+	}
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -284,7 +310,7 @@ func (r *Raft) sendRequestVote(to uint64) bool {
 	}
 	r.msgs = append(r.msgs, msg)
 	if debug {
-		fmt.Printf("%x send raft message %s from %x to %x\n", r.id, pb.MessageType_MsgRequestVote, r.id, to)
+		PrettyDebug(dCandidate, "%x send raft message %s from %x to %x\n", r.id, pb.MessageType_MsgRequestVote, r.id, to)
 	}
 	return true
 }
@@ -292,11 +318,14 @@ func (r *Raft) sendRequestVote(to uint64) bool {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	if debug {
+		PrettyDebug(dTimer, "%x tick at term %d\n", r.id, r.Term)
+	}
 	switch r.State {
 	case StateFollower:
-		if debug {
-			fmt.Println(r.id, "term:", r.Term, "StateFollower", "r.electionElapsed:", r.electionElapsed, "peers num:", len(r.Prs))
-		}
+		// if debug {
+		// 	fmt.Println(r.id, "term:", r.Term, "StateFollower", "r.electionElapsed:", r.electionElapsed, "peers num:", len(r.Prs))
+		// }
 		r.electionElapsed++
 		if r.electionElapsed >= r.electionTimeout {
 			r.electionElapsed = 0 - rand.Intn(r.electionTimeout)
@@ -307,22 +336,25 @@ func (r *Raft) tick() {
 			}
 		}
 	case StateCandidate:
-		if debug {
-			fmt.Println(r.id, "term:", r.Term, "StateCandidate", "r.electionElapsed:", r.electionElapsed, "peers num:", len(r.Prs))
-		}
+		// if debug {
+		// 	fmt.Println(r.id, "term:", r.Term, "StateCandidate", "r.electionElapsed:", r.electionElapsed, "peers num:", len(r.Prs))
+		// }
 		r.electionElapsed++
 		if r.electionElapsed >= r.electionTimeout {
 			r.electionElapsed = 0 - rand.Intn(r.electionTimeout)
 			// 发起投票
+			if debug {
+				PrettyDebug(dCandidate, "%x start election at term %d\n", r.id, r.Term)
+			}
 			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 			if err != nil {
 				return
 			}
 		}
 	case StateLeader:
-		if debug {
-			fmt.Println(r.id, "term:", r.Term, "StateLeader", "r.heartbeatTimeout:", r.heartbeatTimeout, "peers num:", len(r.Prs))
-		}
+		// if debug {
+		// 	fmt.Println(r.id, "term:", r.Term, "StateLeader", "r.heartbeatTimeout:", r.heartbeatTimeout, "peers num:", len(r.Prs))
+		// }
 		r.electionElapsed++
 		num := len(r.heartBeats)
 		length := len(r.Prs) / 2
@@ -333,6 +365,9 @@ func (r *Raft) tick() {
 			r.heartBeats[r.id] = true
 			if num <= length {
 				// 重新发起选举
+				if debug {
+					PrettyDebug(dLeader, "%x start election at term %d\n", r.id, r.Term)
+				}
 				r.campaign()
 			}
 		}
@@ -376,7 +411,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0 - rand.Intn(r.electionTimeout)
 	if debug {
-		fmt.Printf("%x became follower at term %x\n", r.id, r.Term)
+		PrettyDebug(dInfo, "%x became follower at term %x\n", r.id, r.Term)
 	}
 }
 
@@ -393,7 +428,7 @@ func (r *Raft) becomeCandidate() {
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0 - rand.Intn(r.electionTimeout)
 	if debug {
-		fmt.Printf("%x became candidate at term %x\n", r.id, r.Term)
+		PrettyDebug(dInfo, "%x became candidate at term %x\n", r.id, r.Term)
 	}
 }
 
@@ -421,7 +456,7 @@ func (r *Raft) becomeLeader() {
 	r.Prs[r.id].Match = r.Prs[r.id].Next
 	r.Prs[r.id].Next++
 	if debug {
-		fmt.Printf("%x became leader at term %x\n", r.id, r.Term)
+		PrettyDebug(dInfo, "%x became leader at term %x\n", r.id, r.Term)
 	}
 
 	for peer := range r.Prs {
@@ -440,9 +475,9 @@ func (r *Raft) becomeLeader() {
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	if debug {
-		fmt.Printf("%x handle raft message %s from %x to %x at term %x\n", r.id, m.MsgType, m.From, m.To, m.Term)
+		PrettyDebug(dInfo, "%x handle raft message %s from %x to %x at term %x\n", r.id, m.MsgType, m.From, m.To, m.Term)
 		if _, ok := r.Prs[r.id]; !ok {
-			fmt.Printf("%x not exist in r.Prs\n", r.id)
+			PrettyDebug(dError, "%x not exist in r.Prs\n", r.id)
 		}
 	}
 	switch r.State {
@@ -514,7 +549,7 @@ func (r *Raft) CandidateStep(m pb.Message) error {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse: // Candidate only
 		if debug {
-			fmt.Printf("[%d] receive vote response from %d, reject=%v\n", r.id, m.From, m.Reject)
+			PrettyDebug(dVote, "[%d] receive vote response from %d, reject=%v\n", r.id, m.From, m.Reject)
 		}
 		r.votes[m.From] = !m.Reject
 		length := len(r.Prs) / 2
@@ -584,10 +619,10 @@ func (r *Raft) LeaderStep(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse: // leader only，Commit 字段用于告诉 Leader 自己是否落后
 		r.heartBeats[m.From] = true
-		if debug {
-			println(r.id, "MsgHeartbeatResponse, m.Commit:", m.Commit,
-				"r.RaftLog.committed:", r.RaftLog.committed, "m.Reject:", m.Reject)
-		}
+		// if debug {
+		// 	println(r.id, "MsgHeartbeatResponse, m.Commit:", m.Commit,
+		// 		"r.RaftLog.committed:", r.RaftLog.committed, "m.Reject:", m.Reject)
+		// }
 		if m.Commit < r.RaftLog.committed {
 			// 如果follower的commit小于leader的commit，说明follower落后了，需要leader发送数据给follower
 			r.sendAppend(m.From)
@@ -637,7 +672,7 @@ func (r *Raft) sendAppendResponse(to uint64, reject bool, index uint64) {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	// if debug {
-	// 	fmt.Printf("%x handleAppendEntries from %x at term %x\n", r.id, m.From, m.Term)
+	// 	PrettyDebug("%x handleAppendEntries from %x at term %x\n", r.id, m.From, m.Term)
 	// }
 
 	if m.Term < r.Term {
@@ -706,7 +741,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 func (r *Raft) handleMsgAppendResponse(m pb.Message) {
 	// if debug {
-	// 	fmt.Printf("%x handleMsgAppendResponse from %x at term %x\n", r.id, m.From, m.Term)
+	// 	PrettyDebug("%x handleMsgAppendResponse from %x at term %x\n", r.id, m.From, m.Term)
 	// }
 	// 同步failed
 	if m.Reject {
@@ -749,9 +784,9 @@ func (r *Raft) handleMsgAppendResponse(m pb.Message) {
 }
 
 func (r *Raft) handleRequestVote(m pb.Message) {
-	// if debug {
-	// 	fmt.Printf("%x handleRequestVote from %x at term %x\n", r.id, m.From, m.Term)
-	// }
+	if debug {
+		PrettyDebug(dCandidate, "%x handleRequestVote from %x at term %x\n", r.id, m.From, m.Term)
+	}
 	if m.Term < r.Term {
 		msg := pb.Message{
 			MsgType: pb.MessageType_MsgRequestVoteResponse,
@@ -806,9 +841,9 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	// if debug {
-	// 	fmt.Printf("%x handleHeartbeat from %x at term %x\n", r.id, m.From, m.Term)
-	// }
+	if debug {
+		PrettyDebug(dCandidate, "%x handleHeartbeat from %x at term %x\n", r.id, m.From, m.Term)
+	}
 	// 拒绝任期小于自己的心跳包
 	if m.Term < r.Term {
 		msg := pb.Message{
@@ -845,9 +880,9 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 // handle TransferLeader, leader only
 func (r *Raft) handleTransferLeader(m pb.Message) {
-	// if debug {
-	// 	fmt.Printf("%x handleTransferLeader from %x at term %x\n", r.id, m.From, m.Term)
-	// }
+	if debug {
+		PrettyDebug(dLeader, "%x handleTransferLeader from %x at term %x\n", r.id, m.From, m.Term)
+	}
 	if _, ok := r.Prs[m.From]; !ok {
 		return
 	}
@@ -868,6 +903,67 @@ func (r *Raft) handleTransferLeader(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+
+	if m.Term < r.Term {
+		return
+	}
+	if m.Term > r.Term {
+		r.Term = m.Term
+	}
+
+	metaData := m.Snapshot.Metadata
+	snapIndex, snapTerm, snapConfState := metaData.Index, metaData.Term, metaData.ConfState
+	if debug {
+		PrettyDebug(dInfo, "%x handleSnapshot from %x at term %x\n", r.id, m.From, m.Term)
+		PrettyDebug(dSnap, "%x snapshot index %d, term %d\n", r.id, snapIndex, snapTerm)
+
+	}
+	// 如果当前节点的日志更加新，直接返回
+	if snapIndex < r.RaftLog.committed || snapIndex < r.RaftLog.FirstIndex() {
+		return
+	}
+
+	if r.Lead != m.From {
+		r.Lead = m.From
+	}
+
+	// drop all entries before snapshot Index
+	if len(r.RaftLog.entries) > 0 {
+		if snapIndex >= r.RaftLog.LastIndex() {
+			r.RaftLog.entries = nil
+		} else {
+			r.RaftLog.entries = r.RaftLog.entries[snapIndex-r.RaftLog.FirstIndex()+1:]
+		}
+	}
+
+	r.RaftLog.committed = snapIndex
+	r.RaftLog.applied = snapIndex
+	r.RaftLog.stabled = snapIndex
+
+	// load cluster configuration
+	// 集群节点变更
+	if snapConfState != nil {
+		r.Prs = make(map[uint64]*Progress)
+		for _, node := range snapConfState.Nodes {
+			r.Prs[node] = &Progress{}
+			r.Prs[node].Next = r.RaftLog.LastIndex() + 1
+			r.Prs[node].Match = 0
+		}
+	}
+	// 如果raft log的entries是空的，增加一个空的entry
+	if r.RaftLog.LastIndex() < snapIndex {
+		r.RaftLog.entries = append(r.RaftLog.entries,
+			pb.Entry{EntryType: pb.EntryType_EntryNormal,
+				Index: snapIndex,
+				Term:  snapTerm})
+	}
+	if debug {
+		index := r.RaftLog.LastIndex()
+		term, _ := r.RaftLog.Term(index)
+		PrettyDebug(dInfo, "%x raftlog last index %d, term %x\n", r.id, index, term)
+	}
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex())
 }
 
 // addNode add a new node to raft group

@@ -311,31 +311,42 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	if len(entries) == 0 {
 		return nil
 	}
-	var err error = nil
-	enFirstIndex := entries[0].Index
-	enLastIndex := entries[len(entries)-1].Index
-	psFirstIndex, _ := ps.FirstIndex()
-	psLastIndex, _ := ps.LastIndex()
 
-	if enLastIndex < psLastIndex {
+	first, _ := ps.FirstIndex()
+	last := entries[len(entries)-1].Index
+
+	// shortcut if there is no new entry.
+	if last < first {
 		return nil
+	}
+	// truncate compacted entries
+	if first > entries[0].Index {
+		entries = entries[first-entries[0].Index:]
+	}
 
-	}
-	if enFirstIndex < psFirstIndex {
-		entries = entries[psLastIndex-enFirstIndex:]
-	}
-	// set meta
+	regionId := ps.region.GetId()
 	for _, entry := range entries {
-		err = raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+		raftWB.SetMeta(meta.RaftLogKey(regionId, entry.Index), &entry)
 	}
-	// delete conflict
-	for i := enLastIndex + 1; i <= psLastIndex; i++ {
-		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	prevLast, _ := ps.LastIndex()
+	if prevLast > last {
+		for i := last + 1; i <= prevLast; i++ {
+			raftWB.DeleteMeta(meta.RaftLogKey(regionId, i))
+		}
 	}
-	return err
+	ps.raftState.LastIndex = last
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
+
+	// if debug {
+	// 	fmt.Printf("After Append raftState last index: %d, last term: %d\n", ps.raftState.LastIndex, ps.raftState.LastTerm)
+	// }
+	return nil
 }
 
 // Apply the peer with given snapshot
+// 1. 负责应用 Snapshot，先通过 ps.clearMeta 和 ps.clearExtraData() 清除原来的数据，因为新的 snapshot 会包含新的 meta 信息，需要先清除老的。
+// 2. 根据 Snapshot 的 Metadata 信息更新当前的 raftState 和 applyState。并保存信息到 WriteBatch 中，可以等到 SaveReadyState() 方法结束时统一写入 DB。
+// 3. 发送 RegionTaskApply 到 regionSched 安装 snapshot，因为 Snapshot 很大，所以这里通过异步的方式安装。我这里是等待 Snapshot 安装完成后才继续执行，相当于没异步，以防出错。
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
@@ -347,7 +358,40 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			log.Panic(err)
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState)
+
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	<-ch // 同步等待
+
+	result := &ApplySnapResult{PrevRegion: ps.region, Region: snapData.Region}
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal) // update region state
+	if debug {
+		fmt.Printf("After ApplySnapshot raftState last index: %d, last term: %d\n", ps.raftState.LastIndex, ps.raftState.LastTerm)
+		fmt.Printf("After ApplySnapshot region: %v\n", snapData.Region)
+	}
+	return result, nil
 }
 
 // Save memory states to disk.
@@ -355,36 +399,21 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	// var applySnap *ApplySnapResult = nil
-	// kvWB := new(engine_util.WriteBatch)
 	raftWB := new(engine_util.WriteBatch)
-
-	// 持久化entry
-	err := ps.Append(ready.Entries, raftWB)
-	// update raftlocalstate
-	// 1. lastindex
-	// 2. lastterm
-	// 3. HardState
-	if len(ready.Entries) != 0 {
-		newLastIndex := ready.Entries[len(ready.Entries)-1].Index
-		newLastTerm := ready.Entries[len(ready.Entries)-1].Term
-		if newLastIndex > ps.raftState.LastIndex {
-			ps.raftState.LastIndex = newLastIndex
-			ps.raftState.LastTerm = newLastTerm
-		}
+	var result *ApplySnapResult
+	var err error
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		kvWB := new(engine_util.WriteBatch)
+		result, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		kvWB.WriteToDB(ps.Engines.Kv)
 	}
-
+	ps.Append(ready.Entries, raftWB)
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
-
-	// update raftlocalstate
-	err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
-
-	// write in disk
-	err = raftWB.WriteToDB(ps.Engines.Raft)
-	// err = kvWB.WriteToDB(ps.Engines.Kv)
-	return nil, err
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState)
+	raftWB.WriteToDB(ps.Engines.Raft)
+	return result, err
 }
 
 func (ps *PeerStorage) ClearData() {
