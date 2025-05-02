@@ -370,6 +370,10 @@ func (r *Raft) tick() {
 				}
 				r.campaign()
 			}
+			// leader 转移失败，放弃转移
+			if r.leadTransferee != None {
+				r.leadTransferee = None
+			}
 		}
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
@@ -410,6 +414,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Vote = None
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0 - rand.Intn(r.electionTimeout)
+	r.leadTransferee = None
 	if debug {
 		PrettyDebug(dInfo, "%x became follower at term %x\n", r.id, r.Term)
 	}
@@ -427,6 +432,7 @@ func (r *Raft) becomeCandidate() {
 	r.votes[r.id] = true
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0 - rand.Intn(r.electionTimeout)
+	r.leadTransferee = None
 	if debug {
 		PrettyDebug(dInfo, "%x became candidate at term %x\n", r.id, r.Term)
 	}
@@ -781,6 +787,11 @@ func (r *Raft) handleMsgAppendResponse(m pb.Message) {
 
 	}
 
+	// 如果是正在 transfer 的目标，transfer
+	if m.From == r.leadTransferee {
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgTransferLeader, From: m.From})
+	}
+
 }
 
 func (r *Raft) handleRequestVote(m pb.Message) {
@@ -969,11 +980,63 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	_, ok := r.Prs[id]
+	if ok {
+		//log.Panic("node exists")
+		return
+	} else {
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex() + 1,
+		}
+	}
+}
+func (r *Raft) updateCommitIndex() uint64 {
+	// 假设存在 N 满足N > commitIndex，使得大多数的 matchIndex[i] ≥ N以及log[N].term == currentTerm 成立，则令 commitIndex = N
+	match := make(uint64Slice, len(r.Prs))
+	i := 0
+	for _, prs := range r.Prs {
+		match[i] = prs.Match
+		i++
+	}
+	sort.Sort(match)
+	// 大多数的 matchIndex[i] ≥ N
+	maxN := match[(len(r.Prs)-1)/2]
+	N := maxN
+	for ; N > r.RaftLog.committed; N-- {
+		if term, _ := r.RaftLog.Term(N); term == r.Term {
+			break
+		}
+	}
+	r.RaftLog.committed = N
+	return r.RaftLog.committed
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	_, ok := r.Prs[id]
+	if !ok {
+		//log.Panic("node dose not exist")
+		return
+	} else {
+		delete(r.Prs, id)
+	}
+
+	// 重算 committed 并同步
+	if r.State == StateLeader {
+		if len(r.Prs) != 0 {
+			oldCom := r.RaftLog.committed
+			r.updateCommitIndex()
+			if r.RaftLog.committed != oldCom {
+				for pr := range r.Prs {
+					if pr != r.id {
+						r.sendAppend(pr)
+					}
+				}
+			}
+		}
+	}
 }
 
 func (r *Raft) softState() *SoftState {
